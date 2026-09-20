@@ -2,12 +2,13 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
-import { api } from "@/api/client";
-import type { AttributeSchema, Category, Spot } from "@/api/types";
+import { api, ApiError } from "@/api/client";
+import type { AttributeSchema, Category, EditConflict, MergeInfo, Spot } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 import { useCatalogStore } from "@/stores/catalog";
 import { DEFAULT_CENTER } from "@/config/map";
 import AttributeForm from "@/components/AttributeForm.vue";
+import EditConflictPanel from "@/components/EditConflictPanel.vue";
 import LocationPicker from "@/components/LocationPicker.vue";
 import PhotoUploader from "@/components/PhotoUploader.vue";
 
@@ -40,6 +41,11 @@ const reviewFeedback = ref<string | null>(null);
 const canRequestManualReview = ref(false);
 const photoUploader = ref<InstanceType<typeof PhotoUploader> | null>(null);
 
+// 协同编辑：打开页面时的内容版本，保存时回传给服务端做三方合并
+const contentVersion = ref<number | null>(null);
+const editConflicts = ref<EditConflict[]>([]);
+const resolvingConflict = ref(false);
+
 const category = computed<Category | undefined>(() => catalog.byCode(form.value.categoryCode));
 const schema = computed<AttributeSchema | null>(() => category.value?.schema ?? null);
 
@@ -70,6 +76,7 @@ async function loadExisting() {
     form.value.fuzzRadiusM = spot.location.radiusMeters || 50;
     form.value.mediaUuids = spot.media.map((asset) => asset.uuid);
     spotStatus.value = spot.status;
+    contentVersion.value = spot.contentVersion;
 
     // 把审核意见直接展示在编辑页，用户不用来回切换页面
     const revisions = await api
@@ -82,6 +89,12 @@ async function loadExisting() {
     if (latestReview?.decisionReason) {
       reviewFeedback.value = latestReview.decisionReason;
     }
+
+    // 待处理的协同编辑冲突：别人与我同时改了同一字段，需要逐项确认
+    const conflicts = await api
+      .get<{ items: EditConflict[] }>(`/spots/${uuid.value}/edit-conflicts`, { status: "open" })
+      .catch(() => ({ items: [] }));
+    editConflicts.value = conflicts.items;
 
     setTimeout(() => {
       photoUploader.value?.setExisting(
@@ -121,7 +134,14 @@ function onLocationUpdate(payload: { lat: number; lng: number }) {
   form.value.lng = payload.lng;
 }
 
-async function saveDraft(): Promise<string | null> {
+interface SaveOutcome {
+  /** 保存成功后的条目 uuid；发生冲突时为 null */
+  uuid: string | null;
+  /** 与他人同时修改了同一字段，需要先在页面上逐项确认取舍 */
+  hasConflict: boolean;
+}
+
+async function saveDraft(): Promise<SaveOutcome> {
   const payload = {
     categoryCode: form.value.categoryCode,
     title: form.value.title.trim(),
@@ -132,24 +152,52 @@ async function saveDraft(): Promise<string | null> {
     fuzzEnabled: form.value.fuzzEnabled,
     fuzzRadiusM: form.value.fuzzEnabled ? form.value.fuzzRadiusM : 0,
     mediaUuids: form.value.mediaUuids,
+    // 带上打开页面时的版本号，服务端据此做字段级三方合并
+    ...(contentVersion.value !== null ? { baseVersion: contentVersion.value } : {}),
   };
 
   if (isEdit.value && uuid.value) {
-    await api.patch(`/spots/${uuid.value}`, payload);
-    return uuid.value;
+    try {
+      const result = await api.patch<Spot & { merge?: MergeInfo }>(`/spots/${uuid.value}`, payload);
+      contentVersion.value = result.contentVersion;
+      if (result.merge?.merged) {
+        // 别人的改动已并入，表单必须刷新成最新内容，
+        // 否则下次保存会把旧表单当全量状态覆盖掉刚合并来的修改
+        ElMessage.info("已自动合并他人对其他字段的修改，表单已刷新为最新内容");
+        await loadExisting();
+      }
+      return { uuid: uuid.value, hasConflict: false };
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "EDIT_CONFLICT") {
+        const details = error.details as { reason?: string } | undefined;
+        if (details?.reason) {
+          ElMessage.warning("页面内容已过期，已为你刷新，请确认后重新保存");
+        } else {
+          ElMessage.warning("这些字段同时被他人修改，请逐项确认取舍");
+        }
+        // 无冲突字段已被服务端自动合并，刷新表单与冲突列表
+        await loadExisting();
+        return { uuid: null, hasConflict: true };
+      }
+      throw error;
+    }
   }
 
   const created = await api.post<Spot>("/spots", payload);
-  return created.uuid;
+  // 新建后路由只是 replace 到编辑页，组件不会重挂载，
+  // 版本号要在这里就接住，否则这次会话的后续保存拿不到三方合并保护
+  contentVersion.value = created.contentVersion;
+  return { uuid: created.uuid, hasConflict: false };
 }
 
 async function onSaveDraft() {
   saving.value = true;
   try {
-    const id = await saveDraft();
+    const result = await saveDraft();
+    if (result.hasConflict) return;
     ElMessage.success("草稿已保存");
-    if (id && !isEdit.value) {
-      void router.replace({ name: "spot-edit", params: { uuid: id } });
+    if (result.uuid && !isEdit.value) {
+      void router.replace({ name: "spot-edit", params: { uuid: result.uuid } });
     }
   } catch (error) {
     ElMessage.error((error as Error).message);
@@ -167,8 +215,9 @@ async function onSubmit() {
 
   submitting.value = true;
   try {
-    const id = await saveDraft();
-    if (!id) return;
+    const saved = await saveDraft();
+    if (saved.hasConflict || !saved.uuid) return;
+    const id = saved.uuid;
 
     const result = await api.post<{
       status: string;
@@ -205,6 +254,26 @@ async function requestManualReview() {
     ElMessage.error((error as Error).message);
   } finally {
     submitting.value = false;
+  }
+}
+
+/** 逐项确认取舍：选定后服务端落库对应字段，随后刷新表单与剩余冲突 */
+async function onResolveConflict(conflict: EditConflict, choice: "current" | "proposed") {
+  if (!uuid.value) return;
+  resolvingConflict.value = true;
+  try {
+    await api.post(`/spots/${uuid.value}/edit-conflicts/${conflict.uuid}/resolve`, { choice });
+    ElMessage.success(choice === "proposed" ? "已采用这份修改" : "已保留当前内容");
+    await loadExisting();
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "EDIT_CONFLICT_STALE") {
+      ElMessage.warning(error.message);
+      await loadExisting();
+    } else {
+      ElMessage.error((error as Error).message);
+    }
+  } finally {
+    resolvingConflict.value = false;
   }
 }
 
@@ -252,6 +321,15 @@ onMounted(async () => {
         我认为是误判，转人工复核
       </el-button>
     </el-alert>
+
+    <EditConflictPanel
+      v-if="editConflicts.length > 0"
+      :conflicts="editConflicts"
+      :schema="schema"
+      :categories="catalog.categories"
+      :resolving="resolvingConflict"
+      @resolve="onResolveConflict"
+    />
 
     <el-card shadow="never">
       <el-form label-position="top">

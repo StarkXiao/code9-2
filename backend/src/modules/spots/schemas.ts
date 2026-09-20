@@ -19,7 +19,24 @@ export const createSpotSchema = z.object({
   mediaUuids: z.array(z.string().uuid("图片标识不正确")).max(6, "最多 6 张图片").default([]),
 });
 
-export const updateSpotSchema = createSpotSchema.partial();
+export const updateSpotSchema = createSpotSchema.partial().extend({
+  // 携带 baseVersion 表示启用三方合并：服务端以此版本快照为基准做字段级自动合并，
+  // 合并失败的字段返回 409 EDIT_CONFLICT，由编辑者在页面上逐项确认。
+  baseVersion: z.number().int().min(1).optional(),
+});
+
+export const resolveConflictSchema = z.object({
+  choice: z.enum(["current", "proposed"]),
+});
+
+export const conflictUuidParamSchema = z.object({
+  uuid: z.string().uuid("条目标识不正确"),
+  conflictUuid: z.string().uuid("冲突标识不正确"),
+});
+
+export const listConflictsQuerySchema = z.object({
+  status: z.enum(["open", "resolved", "superseded"]).default("open"),
+});
 
 export const listSpotsQuerySchema = z.object({
   bbox: z.string().optional(),

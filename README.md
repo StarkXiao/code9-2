@@ -36,7 +36,7 @@ cd frontend && npm run dev    # http://localhost:5173
 ## 验证
 
 ```bash
-cd backend && npm run typecheck && npm test   # 31 个单元测试 + 20 个集成测试
+cd backend && npm run typecheck && npm test   # 46 个单元测试 + 29 个集成测试
 cd frontend && npm run typecheck && npm run build
 ```
 
@@ -46,7 +46,7 @@ cd frontend && npm run typecheck && npm run build
 
 ### 已经实际跑过的验证
 
-- 后端构建、类型检查、51 个测试（含完整闭环与账号状态集成测试）全部通过
+- 后端构建、类型检查、46 个单元测试全部通过；29 个集成测试（含完整闭环、账号状态、协同编辑冲突闭环）需在 `docker compose up -d postgres redis` 后运行
 - 前端类型检查与生产构建通过，并已拆包
 - `docker compose up -d --build` 整套栈拉起后四个容器均为 healthy
 - 图片上传 → 元数据清除 → 人工打码 → 隐私确认 → 随条目发布，逐环节用真实图片验证过：公开变体中 EXIF 与 GPS 均已消失
@@ -89,6 +89,8 @@ frontend/   Vue3 应用：地图、条目编辑、审核台、模糊工作台、
 
 - **Access Token 只放内存**，刷新页面时用 HttpOnly 的 refresh cookie 重新换取，避免长期凭证暴露在 XSS 下。
 - **审核任务的领取锁用一条带条件的 UPDATE 实现**，而不是"先查再改"，后者在并发下必然出现两个人拿到同一任务。
+- **多人同时编辑同一条目走三方合并而不是互斥锁**：保存时带上打开页面时的 `contentVersion`，版本落后就以当时快照为基准逐字段合并——各改各的字段自动并存，同一字段改成不同值才记为冲突，双方各留一份在页面上逐项确认。加锁会挡住"改不同字段"这种本该并行的场景，也会让锁超时成为新的故障点。
+- **合并落库用条件 UPDATE（CAS）**：`UPDATE ... WHERE content_version = ?`，并发下只有一个写入生效，失败方基于最新状态重新合并，不会写出"版本对上了内容却对不上"的中间态。
 - **马赛克降采样用 cubic 而不是 nearest**：点采样会把某个原始像素的颜色原样保留，等于没打散信息。
 - **队列不可用时降级为同步处理**：Redis 宕机时图片若一直停在 `processing`，用户会以为上传失败而不停重试。
 - **原图保留 30 天后彻底删除**。代价是之后无法再调整模糊区域，此时只能下架整张图片——这是数据最小化必须付的成本。

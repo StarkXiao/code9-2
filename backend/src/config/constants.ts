@@ -18,6 +18,8 @@ export const ERROR_CODES = {
   COMMENT_PII_BLOCKED: "COMMENT_PII_BLOCKED",
   DUPLICATE_REPORT: "DUPLICATE_REPORT",
   ALREADY_CONFIRMED: "ALREADY_CONFIRMED",
+  EDIT_CONFLICT: "EDIT_CONFLICT",
+  EDIT_CONFLICT_STALE: "EDIT_CONFLICT_STALE",
   RATE_LIMITED: "RATE_LIMITED",
   INTERNAL_ERROR: "INTERNAL_ERROR",
 } as const;
@@ -67,6 +69,7 @@ export const NOTIFICATION_TYPES = {
   comment_hidden: "评论被隐藏",
   report_result: "举报处理结果",
   spot_stale: "条目信息可能已过期",
+  edit_conflict: "协同编辑冲突待确认",
 } as const;
 
 export type NotificationType = keyof typeof NOTIFICATION_TYPES;
@@ -107,6 +110,8 @@ export const AUDIT_ACTIONS = {
   USER_ROLE: "user.role",
   SPOT_HIDE: "spot.hide",
   SPOT_RESTORE: "spot.restore",
+  SPOT_EDIT_MERGE: "spot.edit.merge",
+  SPOT_EDIT_CONFLICT_RESOLVE: "spot.edit_conflict.resolve",
   REPORT_RESOLVE: "report.resolve",
   REPORT_DISMISS: "report.dismiss",
   CATEGORY_SCHEMA_UPDATE: "category.schema.update",

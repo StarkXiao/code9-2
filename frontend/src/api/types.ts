@@ -53,6 +53,7 @@ export interface Spot {
   title: string;
   description: string | null;
   status: string;
+  contentVersion: number;
   category: Category;
   attributes: Record<string, unknown>;
   location: SpotLocation;
@@ -72,6 +73,25 @@ export interface Paged<T> {
   page: number;
   pageSize: number;
   total: number;
+}
+
+/** 协同编辑：保存时发生三方合并的返回信息 */
+export interface MergeInfo {
+  merged: boolean;
+  appliedFields: string[];
+}
+
+/** 协同编辑冲突：同一字段的两份版本，等待逐项确认取舍 */
+export interface EditConflict {
+  uuid: string;
+  field: string;
+  base: unknown;
+  current: unknown;
+  proposed: unknown;
+  status: "open" | "resolved" | "superseded";
+  resolution: string | null;
+  proposer: { nickname: string } | null;
+  createdAt: string;
 }
 
 export interface Comment {

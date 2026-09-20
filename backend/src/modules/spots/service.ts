@@ -1,12 +1,13 @@
 import type { Prisma, SpotStatus } from "@prisma/client";
 import { env } from "../../config/env";
 import {
+  AUDIT_ACTIONS,
   CONFIRMATION_COOLDOWN_MS,
   ERROR_CODES,
   STALE_REPORT_THRESHOLD,
   MAX_BBOX_SPAN_DEG,
 } from "../../config/constants";
-import { prisma, toJsonValue } from "../../db/prisma";
+import { asRecord, prisma, toJsonValue } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
 import { parsePagination, pagedResult } from "../../utils/pagination";
 import { assertNoBlockedContent, assertNoPii, checkText } from "../../services/moderation/contentFilter";
@@ -18,8 +19,10 @@ import { serializeSpot } from "../shared/serialize";
 import type { AuthUser } from "../../types/auth";
 import { isModerator } from "../../types/auth";
 import { notify } from "../../services/notify";
+import { recordAudit } from "../../services/audit";
 import { adjustCredit, CREDIT_DELTAS } from "../../services/moderation/credit";
 import { logger } from "../../utils/logger";
+import { deepEqual, mergeSpotStates, type EditableState, type FieldConflict } from "./merge";
 import type { CreateSpotInput, ListSpotsQuery, UpdateSpotInput } from "./schemas";
 
 const MS_PER_DAY = 86400000;
@@ -253,10 +256,17 @@ export async function getSpotByUuid(uuid: string, viewer?: AuthUser) {
 
 // ------------------------------------------------------------------ 写入
 
-async function attachMedia(spotId: bigint | null, ownerId: bigint, mediaUuids: string[]) {
+type DbHandle = Prisma.TransactionClient | typeof prisma;
+
+/**
+ * 图片归属校验：只能挂"条目作者或当前编辑者"上传的图。
+ * 协同编辑时审核员可以把自己拍的照片补进别人的条目（提案被采纳即视为授权），
+ * 但任何情况下都不能挂无关第三方的图。
+ */
+async function attachMedia(db: DbHandle, spotId: bigint | null, allowedOwnerIds: bigint[], mediaUuids: string[]) {
   if (mediaUuids.length === 0) return;
 
-  const assets = await prisma.mediaAsset.findMany({
+  const assets = await db.mediaAsset.findMany({
     where: { uuid: { in: mediaUuids } },
     select: { id: true, ownerId: true, uuid: true },
   });
@@ -264,10 +274,10 @@ async function attachMedia(spotId: bigint | null, ownerId: bigint, mediaUuids: s
   if (assets.length !== mediaUuids.length) {
     throw AppError.badRequest("部分图片不存在或已被清理");
   }
-  const foreign = assets.find((asset) => asset.ownerId !== ownerId);
+  const foreign = assets.find((asset) => !allowedOwnerIds.includes(asset.ownerId));
   if (foreign) throw AppError.forbidden("不能使用他人上传的图片");
 
-  await prisma.mediaAsset.updateMany({
+  await db.mediaAsset.updateMany({
     where: { uuid: { in: mediaUuids } },
     data: { spotId },
   });
@@ -293,32 +303,124 @@ export async function createDraft(user: AuthUser, input: CreateSpotInput) {
   }
 
   // 草稿阶段不强制必填属性，用户可以先存一半再去现场确认
-  const spot = await prisma.spot.create({
-    data: {
-      ownerId: user.id,
-      categoryId: category.id,
-      status: "draft",
-      title: input.title,
-      description: input.description || null,
-      attributes: toJsonValue(input.attributes),
-      exactLat: input.lat,
-      exactLng: input.lng,
-      fuzzEnabled: input.fuzzEnabled,
-      fuzzRadiusM: input.fuzzEnabled ? input.fuzzRadiusM : 0,
-    },
-    select: { id: true, uuid: true },
-  });
+  const spot = await prisma.$transaction(async (tx) => {
+    const created = await tx.spot.create({
+      data: {
+        ownerId: user.id,
+        categoryId: category.id,
+        status: "draft",
+        title: input.title,
+        description: input.description || null,
+        attributes: toJsonValue(input.attributes),
+        exactLat: input.lat,
+        exactLng: input.lng,
+        fuzzEnabled: input.fuzzEnabled,
+        fuzzRadiusM: input.fuzzEnabled ? input.fuzzRadiusM : 0,
+      },
+      select: { id: true, uuid: true },
+    });
 
-  if (input.mediaUuids.length > 0) {
-    await attachMedia(spot.id, user.id, input.mediaUuids);
-  }
+    if (input.mediaUuids.length > 0) {
+      await attachMedia(tx, created.id, [user.id], input.mediaUuids);
+    }
+    // v1 快照：之后所有并发编辑都拿它当三方合并的起点
+    await writeEditSnapshot(tx, created.id, user.id);
+    return created;
+  });
 
   return getSpotByUuid(spot.uuid, user);
 }
 
 const EDITABLE_STATUSES: SpotStatus[] = ["draft", "changes_requested", "auto_rejected", "rejected"];
 
-export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput) {
+// ------------------------------------------------------------------ 协同编辑：快照与三方合并
+
+const spotStateInclude = {
+  category: true,
+  media: { select: { uuid: true }, orderBy: { id: "asc" as const } },
+} satisfies Prisma.SpotInclude;
+
+type SpotWithState = Prisma.SpotGetPayload<{ include: typeof spotStateInclude }>;
+
+/** 从条目当前内容提取参与合并的字段集合 */
+function editableStateFromSpot(spot: SpotWithState): EditableState {
+  return {
+    title: spot.title,
+    description: spot.description ?? null,
+    categoryCode: spot.category.code,
+    attributes: asRecord(spot.attributes),
+    lat: spot.exactLat,
+    lng: spot.exactLng,
+    fuzzEnabled: spot.fuzzEnabled,
+    fuzzRadiusM: spot.fuzzRadiusM,
+    mediaUuids: spot.media.map((asset) => asset.uuid),
+  };
+}
+
+/** 内容变更落库后写一份快照，作为后续并发编辑的合并基准 */
+async function writeEditSnapshot(tx: Prisma.TransactionClient, spotId: bigint, editorId: bigint | null) {
+  const fresh = await tx.spot.findUniqueOrThrow({ where: { id: spotId }, include: spotStateInclude });
+  const state = editableStateFromSpot(fresh);
+  await tx.spotEditSnapshot.upsert({
+    where: { spotId_version: { spotId, version: fresh.contentVersion } },
+    create: { spotId, version: fresh.contentVersion, editorId, snapshot: toJsonValue(state) },
+    update: { editorId, snapshot: toJsonValue(state) },
+  });
+}
+
+async function applyMediaChange(
+  tx: Prisma.TransactionClient,
+  spot: { id: bigint; ownerId: bigint },
+  mediaUuids: string[],
+  editorId: bigint,
+) {
+  await tx.mediaAsset.updateMany({ where: { spotId: spot.id }, data: { spotId: null } });
+  const allowedOwners = spot.ownerId === editorId ? [spot.ownerId] : [spot.ownerId, editorId];
+  await attachMedia(tx, spot.id, allowedOwners, mediaUuids);
+}
+
+/**
+ * 把一份合并后的完整状态转成数据库更新。
+ * 校验在这里集中做：无论直接保存还是冲突解决后落库，内容门禁强度一致。
+ * 返回 Unchecked（标量外键）形态：合并路径走 updateMany 做 CAS，不支持关系写法。
+ */
+async function buildContentUpdate(
+  current: { id: bigint; status: SpotStatus },
+  state: EditableState,
+  user: AuthUser,
+): Promise<Prisma.SpotUncheckedUpdateInput> {
+  assertNoBlockedContent(state.title, state.description);
+  if (!isValidLatLng(state.lat, state.lng)) throw AppError.badRequest("坐标不合法");
+  const category = await requireCategoryByCode(state.categoryCode);
+
+  const data: Prisma.SpotUncheckedUpdateInput = {
+    title: state.title,
+    description: state.description || null,
+    categoryId: category.id,
+    attributes: toJsonValue(state.attributes),
+    exactLat: state.lat,
+    exactLng: state.lng,
+    fuzzEnabled: state.fuzzEnabled,
+    fuzzRadiusM: state.fuzzEnabled ? state.fuzzRadiusM : 0,
+  };
+
+  // 已发布的条目被修改后需要重新审核，直接回到草稿状态
+  if (current.status === "published" && !isModerator(user)) {
+    data.status = "draft";
+    data.publishedAt = null;
+    data.publicLat = null;
+    data.publicLng = null;
+  }
+  return data;
+}
+
+export interface SpotUpdateResult {
+  spot: Record<string, unknown>;
+  /** 本次保存发生了三方合并时带上合并信息，前端据此提示并刷新表单 */
+  merge?: { merged: boolean; appliedFields: string[] };
+}
+
+export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput): Promise<SpotUpdateResult> {
   const spot = await prisma.spot.findUnique({ where: { uuid } });
   if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
   if (spot.ownerId !== user.id && !isModerator(user)) {
@@ -331,7 +433,19 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
     );
   }
 
-  const data: Prisma.SpotUpdateInput = {};
+  if (input.baseVersion !== undefined) {
+    return updateWithMerge(spot, user, input as UpdateSpotInput & { baseVersion: number });
+  }
+  return updateLegacy(spot, user, input);
+}
+
+/** 不带 baseVersion 的旧式保存：保持部分更新语义，同时维护版本号与快照 */
+async function updateLegacy(
+  spot: { id: bigint; uuid: string; ownerId: bigint; status: SpotStatus; title: string; description: string | null },
+  user: AuthUser,
+  input: UpdateSpotInput,
+): Promise<SpotUpdateResult> {
+  const data: Prisma.SpotUncheckedUpdateInput = {};
 
   if (input.title !== undefined) data.title = input.title;
   if (input.description !== undefined) data.description = input.description || null;
@@ -341,7 +455,7 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
 
   if (input.categoryCode !== undefined) {
     const category = await requireCategoryByCode(input.categoryCode);
-    data.category = { connect: { id: category.id } };
+    data.categoryId = category.id;
   }
   if (input.attributes !== undefined) data.attributes = toJsonValue(input.attributes);
   if (input.lat !== undefined) data.exactLat = input.lat;
@@ -363,14 +477,328 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
     data.publicLng = null;
   }
 
-  await prisma.spot.update({ where: { id: spot.id }, data });
+  await prisma.$transaction(async (tx) => {
+    await tx.spot.update({ where: { id: spot.id }, data: { ...data, contentVersion: { increment: 1 } } });
+    if (input.mediaUuids !== undefined) {
+      await applyMediaChange(tx, spot, input.mediaUuids, user.id);
+    }
+    await writeEditSnapshot(tx, spot.id, user.id);
+  });
 
-  if (input.mediaUuids !== undefined) {
-    await prisma.mediaAsset.updateMany({ where: { spotId: spot.id }, data: { spotId: null } });
-    await attachMedia(spot.id, spot.ownerId, input.mediaUuids);
+  return { spot: await getSpotByUuid(spot.uuid, user) };
+}
+
+/**
+ * 带 baseVersion 的协同保存。
+ *
+ * 版本一致 → 直接全量应用；
+ * 版本落后 → 以 baseVersion 快照为基准做字段级三方合并：
+ *   无冲突字段自动合并落库；
+ *   冲突字段保留当前值，双方版本各存一份（spot_edit_conflicts），
+ *   返回 409 EDIT_CONFLICT，由编辑者在页面上逐项确认取舍。
+ */
+async function updateWithMerge(
+  spot: { id: bigint; uuid: string },
+  user: AuthUser,
+  input: UpdateSpotInput & { baseVersion: number },
+): Promise<SpotUpdateResult> {
+  // 协同保存必须是全量字段，否则无法区分"这个字段没改"和"这个字段没传"
+  if (
+    input.title === undefined ||
+    input.categoryCode === undefined ||
+    input.attributes === undefined ||
+    input.lat === undefined ||
+    input.lng === undefined ||
+    input.fuzzEnabled === undefined ||
+    input.fuzzRadiusM === undefined ||
+    input.mediaUuids === undefined
+  ) {
+    throw AppError.badRequest("协同保存需要提交完整字段，请刷新页面后重试");
   }
 
-  return getSpotByUuid(uuid, user);
+  const proposed: EditableState = {
+    title: input.title,
+    description: input.description || null,
+    categoryCode: input.categoryCode,
+    attributes: input.attributes,
+    lat: input.lat,
+    lng: input.lng,
+    fuzzEnabled: input.fuzzEnabled,
+    fuzzRadiusM: input.fuzzEnabled ? input.fuzzRadiusM : 0,
+    mediaUuids: input.mediaUuids,
+  };
+
+  // 先校验提交者自己的内容，与旧式保存的拦截口径一致
+  assertNoBlockedContent(proposed.title, proposed.description);
+
+  // 并发下 CAS 可能失败，失败后基于最新状态重新合并，有限次重试
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = await prisma.spot.findUniqueOrThrow({ where: { id: spot.id }, include: spotStateInclude });
+
+    if (input.baseVersion > current.contentVersion) {
+      throw AppError.badRequest("版本号异常，请刷新页面后重试");
+    }
+
+    const currentState = editableStateFromSpot(current);
+    let outcome: { state: EditableState; conflicts: FieldConflict[]; appliedFields: string[] };
+    let cleanMerge = false;
+
+    if (input.baseVersion === current.contentVersion) {
+      // 没人抢先，直接应用
+      outcome = { state: proposed, conflicts: [], appliedFields: [] };
+    } else {
+      const baseSnapshot = await prisma.spotEditSnapshot.findUnique({
+        where: { spotId_version: { spotId: current.id, version: input.baseVersion } },
+      });
+      if (!baseSnapshot) {
+        throw new AppError(409, ERROR_CODES.EDIT_CONFLICT, "编辑基准版本已过期，请刷新页面获取最新内容后再修改", {
+          reason: "BASE_SNAPSHOT_MISSING",
+        });
+      }
+      outcome = mergeSpotStates(baseSnapshot.snapshot as unknown as EditableState, currentState, proposed);
+      cleanMerge = outcome.conflicts.length === 0;
+    }
+
+    const data = await buildContentUpdate(current, outcome.state, user);
+
+    if (outcome.conflicts.length === 0) {
+      const applied = await prisma.$transaction(async (tx) => {
+        const result = await tx.spot.updateMany({
+          where: { id: current.id, contentVersion: current.contentVersion },
+          data: { ...data, contentVersion: { increment: 1 } },
+        });
+        if (result.count === 0) return false;
+        await applyMediaChange(tx, current, outcome.state.mediaUuids, user.id);
+        await writeEditSnapshot(tx, current.id, user.id);
+        return true;
+      });
+      if (!applied) continue;
+
+      return {
+        spot: await getSpotByUuid(spot.uuid, user),
+        merge: cleanMerge ? { merged: true, appliedFields: outcome.appliedFields } : undefined,
+      };
+    }
+
+    // 有冲突：干净字段落库，冲突字段保留当前值，双方版本各留一份
+    const conflicts = await prisma.$transaction(async (tx) => {
+      const result = await tx.spot.updateMany({
+        where: { id: current.id, contentVersion: current.contentVersion },
+        data: { ...data, contentVersion: { increment: 1 } },
+      });
+      if (result.count === 0) return null;
+
+      await applyMediaChange(tx, current, outcome.state.mediaUuids, user.id);
+      await writeEditSnapshot(tx, current.id, user.id);
+
+      // 同一编辑者对同一字段的旧冲突作废，避免反复保存越积越多
+      await tx.spotEditConflict.updateMany({
+        where: {
+          spotId: current.id,
+          proposedBy: user.id,
+          status: "open",
+          field: { in: outcome.conflicts.map((conflict) => conflict.field) },
+        },
+        data: { status: "superseded" },
+      });
+
+      const created = [];
+      for (const conflict of outcome.conflicts) {
+        created.push(
+          await tx.spotEditConflict.create({
+            data: {
+              spotId: current.id,
+              field: conflict.field,
+              baseValue: toJsonValue(conflict.base ?? null),
+              currentValue: toJsonValue(conflict.current ?? null),
+              proposedValue: toJsonValue(conflict.proposed ?? null),
+              proposedBy: user.id,
+            },
+            include: { proposer: { select: { nickname: true } } },
+          }),
+        );
+      }
+      return created;
+    });
+    if (conflicts === null) continue;
+
+    // 冲突来自别人的条目时通知作者，冲突不会悄悄躺着没人管
+    if (current.ownerId !== user.id) {
+      await notify({
+        userId: current.ownerId,
+        type: "edit_conflict",
+        title: "你的条目有编辑冲突待确认",
+        body: `有人同时修改了「${current.title}」，${conflicts.length} 个字段需要确认取舍。`,
+        payload: { spotUuid: current.uuid },
+      });
+    }
+
+    await recordAudit({
+      actorId: user.id,
+      action: AUDIT_ACTIONS.SPOT_EDIT_MERGE,
+      targetType: "spot",
+      targetId: current.id,
+      after: { baseVersion: input.baseVersion, conflictFields: outcome.conflicts.map((conflict) => conflict.field) },
+    });
+
+    throw new AppError(409, ERROR_CODES.EDIT_CONFLICT, `有 ${conflicts.length} 个字段与他人同时修改，请逐项确认取舍`, {
+      contentVersion: current.contentVersion + 1,
+      conflicts: conflicts.map(serializeEditConflict),
+    });
+  }
+
+  throw new AppError(409, ERROR_CODES.EDIT_CONFLICT, "该条目正被多人同时编辑，请刷新页面后重试", {
+    reason: "RETRY_EXHAUSTED",
+  });
+}
+
+// ------------------------------------------------------------------ 协同编辑：冲突查询与解决
+
+type ConflictRow = Prisma.SpotEditConflictGetPayload<{ include: { proposer: { select: { nickname: true } } } }>;
+
+function serializeEditConflict(conflict: ConflictRow) {
+  return {
+    uuid: conflict.uuid,
+    field: conflict.field,
+    base: conflict.baseValue ?? null,
+    current: conflict.currentValue ?? null,
+    proposed: conflict.proposedValue ?? null,
+    status: conflict.status,
+    resolution: conflict.resolution,
+    proposer: conflict.proposer ? { nickname: conflict.proposer.nickname } : null,
+    createdAt: conflict.createdAt,
+  };
+}
+
+export async function listEditConflicts(uuid: string, user: AuthUser, status: "open" | "resolved" | "superseded") {
+  const spot = await prisma.spot.findUnique({ where: { uuid }, select: { id: true, ownerId: true, deletedAt: true } });
+  if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
+
+  const involved = await prisma.spotEditConflict.findFirst({
+    where: { spotId: spot.id, proposedBy: user.id },
+    select: { id: true },
+  });
+  if (spot.ownerId !== user.id && !isModerator(user) && !involved) {
+    throw AppError.forbidden("无权查看该条目的编辑冲突");
+  }
+
+  const conflicts = await prisma.spotEditConflict.findMany({
+    where: { spotId: spot.id, status },
+    include: { proposer: { select: { nickname: true } } },
+    orderBy: { id: "asc" },
+  });
+  return conflicts.map(serializeEditConflict);
+}
+
+/** 读取条目某字段的当前值，用于解决冲突前的"期间又有新改动"检查 */
+function fieldValueFromSpot(spot: SpotWithState, field: string): unknown {
+  const state = editableStateFromSpot(spot);
+  if (field === "title") return state.title;
+  if (field === "description") return state.description;
+  if (field === "categoryCode") return state.categoryCode;
+  if (field === "location") return { lat: state.lat, lng: state.lng };
+  if (field === "fuzz") return { enabled: state.fuzzEnabled, radiusM: state.fuzzRadiusM };
+  if (field === "media") return state.mediaUuids;
+  if (field === "attributes") return state.attributes;
+  if (field.startsWith("attributes.")) return state.attributes[field.slice("attributes.".length)] ?? null;
+  return null;
+}
+
+/** 把冲突里选定的值写回合并状态的对应字段 */
+function applyFieldValue(state: EditableState, field: string, value: unknown): void {
+  if (field === "title") state.title = String(value ?? "");
+  else if (field === "description") state.description = typeof value === "string" && value !== "" ? value : null;
+  else if (field === "categoryCode") state.categoryCode = String(value ?? "");
+  else if (field === "location") {
+    const location = asRecord(value);
+    state.lat = Number(location.lat);
+    state.lng = Number(location.lng);
+  } else if (field === "fuzz") {
+    const fuzz = asRecord(value);
+    state.fuzzEnabled = Boolean(fuzz.enabled);
+    state.fuzzRadiusM = Number(fuzz.radiusM ?? 0);
+  } else if (field === "media") {
+    state.mediaUuids = Array.isArray(value) ? value.map(String) : [];
+  } else if (field === "attributes") {
+    state.attributes = asRecord(value);
+  } else if (field.startsWith("attributes.")) {
+    const key = field.slice("attributes.".length);
+    if (value === null || value === undefined) delete state.attributes[key];
+    else state.attributes[key] = value;
+  } else {
+    throw AppError.badRequest(`未知的冲突字段：${field}`);
+  }
+}
+
+/**
+ * 逐项确认取舍：choice=current 保留条目当前值，choice=proposed 采用对方提交的版本。
+ * 冲突登记后如果该字段又有了新改动，这条冲突已经过时，作废并要求刷新——
+ * 否则"采用旧提案"会把更新的修改无声覆盖掉。
+ */
+export async function resolveEditConflict(uuid: string, conflictUuid: string, user: AuthUser, choice: "current" | "proposed") {
+  const spot = await prisma.spot.findUnique({ where: { uuid }, include: spotStateInclude });
+  if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
+
+  const conflict = await prisma.spotEditConflict.findUnique({ where: { uuid: conflictUuid } });
+  if (!conflict || conflict.spotId !== spot.id) throw AppError.notFound("冲突记录不存在");
+  if (conflict.status !== "open") {
+    throw AppError.conflict(ERROR_CODES.EDIT_CONFLICT_STALE, "这条冲突已被处理过，请刷新列表");
+  }
+
+  const allowed = spot.ownerId === user.id || isModerator(user) || conflict.proposedBy === user.id;
+  if (!allowed) throw AppError.forbidden("只有条目作者、冲突的编辑者或审核员可以处理冲突");
+
+  if (!deepEqual(fieldValueFromSpot(spot, conflict.field), conflict.currentValue ?? null)) {
+    await prisma.spotEditConflict.update({ where: { id: conflict.id }, data: { status: "superseded" } });
+    throw AppError.conflict(ERROR_CODES.EDIT_CONFLICT_STALE, "该字段已有更新的修改，这条冲突已作废，请刷新后查看");
+  }
+
+  // 状态迁移与内容落库放进同一事务，并以 status=open 为条件：
+  // 两人同时点"确认"时只有一方生效，不会把同一份提案应用两次
+  const markResolved = {
+    status: "resolved" as const,
+    resolution: choice,
+    resolvedBy: user.id,
+    resolvedAt: new Date(),
+  };
+
+  if (choice === "proposed") {
+    const state = editableStateFromSpot(spot);
+    applyFieldValue(state, conflict.field, conflict.proposedValue);
+    const data = await buildContentUpdate(spot, state, user);
+
+    await prisma.$transaction(async (tx) => {
+      const marked = await tx.spotEditConflict.updateMany({
+        where: { id: conflict.id, status: "open" },
+        data: markResolved,
+      });
+      if (marked.count === 0) {
+        throw AppError.conflict(ERROR_CODES.EDIT_CONFLICT_STALE, "这条冲突已被处理过，请刷新列表");
+      }
+      await tx.spot.update({ where: { id: spot.id }, data: { ...data, contentVersion: { increment: 1 } } });
+      // 提案里的图是提案人上传的，采纳提案即视为授权挂到条目上
+      await applyMediaChange(tx, spot, state.mediaUuids, conflict.proposedBy);
+      await writeEditSnapshot(tx, spot.id, user.id);
+    });
+  } else {
+    const marked = await prisma.spotEditConflict.updateMany({
+      where: { id: conflict.id, status: "open" },
+      data: markResolved,
+    });
+    if (marked.count === 0) {
+      throw AppError.conflict(ERROR_CODES.EDIT_CONFLICT_STALE, "这条冲突已被处理过，请刷新列表");
+    }
+  }
+
+  await recordAudit({
+    actorId: user.id,
+    action: AUDIT_ACTIONS.SPOT_EDIT_CONFLICT_RESOLVE,
+    targetType: "spot",
+    targetId: spot.id,
+    reason: `${conflict.field} → ${choice === "proposed" ? "采用对方修改" : "保留当前值"}`,
+  });
+
+  return { conflictUuid, field: conflict.field, choice, status: "resolved" as const };
 }
 
 export async function deleteSpot(uuid: string, user: AuthUser) {

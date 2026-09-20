@@ -8,9 +8,12 @@ import { rateLimit } from "../../middleware/rateLimit";
 import {
   appealSchema,
   confirmSchema,
+  conflictUuidParamSchema,
   createSpotSchema,
+  listConflictsQuerySchema,
   listSpotsQuerySchema,
   mySpotsQuerySchema,
+  resolveConflictSchema,
   updateSpotSchema,
   uuidParamSchema,
 } from "./schemas";
@@ -20,10 +23,12 @@ import {
   createDraft,
   deleteSpot,
   getSpotByUuid,
+  listEditConflicts,
   listMyFavorites,
   listMySpots,
   listRevisions,
   listSpots,
+  resolveEditConflict,
   setFavorite,
   submitForReview,
   updateSpot,
@@ -75,8 +80,32 @@ spotsRouter.patch(
   writeLimiter,
   validate({ params: uuidParamSchema, body: updateSpotSchema }),
   asyncHandler(async (req, res) => {
-    const spot = await updateSpot(req.params.uuid, req.user!, req.body);
-    res.json(ok(req, spot));
+    const result = await updateSpot(req.params.uuid, req.user!, req.body);
+    // 发生三方合并时把合并信息一并带回，前端据此刷新表单并提示
+    res.json(ok(req, result.merge ? { ...result.spot, merge: result.merge } : result.spot));
+  }),
+);
+
+spotsRouter.get(
+  "/spots/:uuid/edit-conflicts",
+  requireAuth,
+  validate({ params: uuidParamSchema, query: listConflictsQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const query = req.query as unknown as z.infer<typeof listConflictsQuerySchema>;
+    const items = await listEditConflicts(req.params.uuid, req.user!, query.status);
+    res.json(ok(req, { items }));
+  }),
+);
+
+spotsRouter.post(
+  "/spots/:uuid/edit-conflicts/:conflictUuid/resolve",
+  requireAuth,
+  requireActiveWriter,
+  writeLimiter,
+  validate({ params: conflictUuidParamSchema, body: resolveConflictSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await resolveEditConflict(req.params.uuid, req.params.conflictUuid, req.user!, req.body.choice);
+    res.json(ok(req, result));
   }),
 );
 

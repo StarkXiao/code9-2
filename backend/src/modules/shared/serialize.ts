@@ -72,6 +72,7 @@ export interface SpotLike {
   freshnessScore: number;
   confirmCount: number;
   isStale: boolean;
+  contentVersion: number;
   publishedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -99,6 +100,8 @@ export function serializeSpot(spot: SpotLike, options: SpotSerializeOptions = {}
     title: spot.title,
     description: spot.description,
     status: spot.status,
+    // 协同编辑的版本令牌：编辑页保存时回传，服务端据此做三方合并
+    contentVersion: spot.contentVersion,
     category: serializeCategory(spot.category),
     attributes: spot.attributes ?? {},
     location: {

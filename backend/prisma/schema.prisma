@@ -85,6 +85,12 @@ enum BlurAlgorithm {
   gaussian
 }
 
+enum EditConflictStatus {
+  open
+  resolved
+  superseded
+}
+
 model User {
   id            BigInt     @id @default(autoincrement())
   uuid          String     @unique @default(uuid()) @db.Uuid
@@ -108,6 +114,9 @@ model User {
   refreshTokens     RefreshToken[]
   spots             Spot[]
   spotRevisions     SpotRevision[]
+  spotEditSnapshots SpotEditSnapshot[]
+  editConflictsProposed SpotEditConflict[] @relation("EditConflictProposer")
+  editConflictsResolved SpotEditConflict[] @relation("EditConflictResolver")
   mediaAssets       MediaAsset[]
   mediaConfirmed    MediaAsset[]       @relation("MediaPrivacyConfirmedBy")
   comments          Comment[]
@@ -215,6 +224,8 @@ model Spot {
   confirmCount       Int        @default(0) @map("confirm_count")
   staleReportCount   Int        @default(0) @map("stale_report_count")
   currentRevisionId  BigInt?    @map("current_revision_id")
+  // 内容版本号：每次内容字段变更 +1，是协同编辑三路合并的乐观并发令牌
+  contentVersion     Int         @default(1) @map("content_version")
   publishedAt        DateTime?  @map("published_at") @db.Timestamptz(6)
   archivedAt         DateTime?  @map("archived_at") @db.Timestamptz(6)
   deletedAt          DateTime?  @map("deleted_at") @db.Timestamptz(6)
@@ -224,6 +235,8 @@ model Spot {
   owner         User              @relation(fields: [ownerId], references: [id])
   category      Category          @relation(fields: [categoryId], references: [id])
   revisions     SpotRevision[]
+  editSnapshots SpotEditSnapshot[]
+  editConflicts SpotEditConflict[]
   media         MediaAsset[]
   reviewTasks   ReviewTask[]
   comments      Comment[]
@@ -252,6 +265,47 @@ model SpotRevision {
 
   @@unique([spotId, revisionNo], map: "spot_revisions_spot_id_revision_no_key")
   @@map("spot_revisions")
+}
+
+// 每次内容变更后的字段快照，是三方合并（base / current / proposed）里的 base。
+// 与 spot_revisions 不同：revision 是提交审核时的业务快照，这里是纯并发控制数据。
+model SpotEditSnapshot {
+  id        BigInt   @id @default(autoincrement())
+  spotId    BigInt   @map("spot_id")
+  version   Int
+  editorId  BigInt?  @map("editor_id")
+  snapshot  Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  spot   Spot  @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  editor User? @relation(fields: [editorId], references: [id])
+
+  @@unique([spotId, version], map: "spot_edit_snapshots_spot_id_version_key")
+  @@map("spot_edit_snapshots")
+}
+
+// 合并失败的字段在这里双方各留一份，等编辑者在页面上逐项确认取舍
+model SpotEditConflict {
+  id            BigInt             @id @default(autoincrement())
+  uuid          String             @unique @default(uuid()) @db.Uuid
+  spotId        BigInt             @map("spot_id")
+  field         String             @db.VarChar(64)
+  baseValue     Json?              @map("base_value")
+  currentValue  Json?              @map("current_value")
+  proposedValue Json?              @map("proposed_value")
+  proposedBy    BigInt             @map("proposed_by")
+  status        EditConflictStatus @default(open)
+  resolution    String?            @db.VarChar(16)
+  resolvedBy    BigInt?            @map("resolved_by")
+  resolvedAt    DateTime?          @map("resolved_at") @db.Timestamptz(6)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  spot      Spot  @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  proposer  User  @relation("EditConflictProposer", fields: [proposedBy], references: [id])
+  resolver  User? @relation("EditConflictResolver", fields: [resolvedBy], references: [id])
+
+  @@index([spotId, status], map: "idx_spot_edit_conflicts_spot")
+  @@map("spot_edit_conflicts")
 }
 
 model MediaAsset {

@@ -474,6 +474,26 @@ async function main(): Promise<void> {
       data: { currentRevisionId: revision.id },
     });
 
+    // 协同编辑的 v1 快照：种子数据也要能作为三方合并的基准
+    await prisma.spotEditSnapshot.create({
+      data: {
+        spotId: record.id,
+        version: 1,
+        editorId: ownerId,
+        snapshot: toJsonValue({
+          title: spot.title,
+          description: spot.description,
+          categoryCode: spot.categoryCode,
+          attributes: spot.attributes,
+          lat: spot.lat,
+          lng: spot.lng,
+          fuzzEnabled: true,
+          fuzzRadiusM: spot.fuzzRadiusM,
+          mediaUuids: [],
+        }),
+      },
+    });
+
     // 待审核的示例条目同时建一条审核工单，让审核台开箱就有内容
     if (spot.status === "pending") {
       await prisma.reviewTask.create({
