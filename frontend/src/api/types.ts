@@ -74,6 +74,33 @@ export interface Paged<T> {
   total: number;
 }
 
+/** PATCH /spots/:uuid 的响应：保存成功时带回自动合并信息 */
+export interface SpotSaveResult extends Spot {
+  merge: { autoMergedFields: string[] } | null;
+}
+
+/** 409 EDIT_CONFLICT 的 details：冲突字段三方各留一份，供逐项确认 */
+export interface EditConflictItem {
+  field: string;
+  base: unknown;
+  theirs: unknown;
+  yours: unknown;
+}
+
+export interface EditConflictDetails {
+  currentUpdatedAt: string;
+  conflicts: EditConflictItem[];
+  merged: Record<string, unknown> | null;
+}
+
+/** 冲突解决面板使用的展示项（值已格式化为文本） */
+export interface ConflictDisplayItem {
+  field: string;
+  label: string;
+  mine: string;
+  theirs: string;
+}
+
 export interface Comment {
   id: string;
   body: string;

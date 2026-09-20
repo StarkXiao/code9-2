@@ -20,6 +20,7 @@ import { isModerator } from "../../types/auth";
 import { notify } from "../../services/notify";
 import { adjustCredit, CREDIT_DELTAS } from "../../services/moderation/credit";
 import { logger } from "../../utils/logger";
+import { mergeSpotInput, type FieldConflict, type SpotFormState } from "./merge";
 import type { CreateSpotInput, ListSpotsQuery, UpdateSpotInput } from "./schemas";
 
 const MS_PER_DAY = 86400000;
@@ -318,8 +319,33 @@ export async function createDraft(user: AuthUser, input: CreateSpotInput) {
 
 const EDITABLE_STATUSES: SpotStatus[] = ["draft", "changes_requested", "auto_rejected", "rejected"];
 
-export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput) {
-  const spot = await prisma.spot.findUnique({ where: { uuid } });
+/** 并发编辑冲突时抛出的 409 详情，前端据此渲染"逐项确认取舍"的界面 */
+export interface EditConflictDetails {
+  /** 服务端当前的 updatedAt，解决冲突后重新提交时作为新的基线版本 */
+  currentUpdatedAt: Date;
+  conflicts: FieldConflict[];
+  /** 非冲突字段已自动合并后的完整表单（冲突字段预填编辑者自己的值） */
+  merged: SpotFormState | null;
+}
+
+function editConflictError(message: string, details: EditConflictDetails) {
+  return new AppError(409, ERROR_CODES.EDIT_CONFLICT, message, details);
+}
+
+export interface UpdateSpotOutcome {
+  spot: Awaited<ReturnType<typeof getSpotByUuid>>;
+  /** 本次保存自动合并了哪些对方修改的字段；未发生并发时为 null */
+  merge: { autoMergedFields: string[] } | null;
+}
+
+export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput): Promise<UpdateSpotOutcome> {
+  const spot = await prisma.spot.findUnique({
+    where: { uuid },
+    include: {
+      category: { select: { code: true } },
+      media: { select: { uuid: true }, orderBy: { id: "asc" } },
+    },
+  });
   if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
   if (spot.ownerId !== user.id && !isModerator(user)) {
     throw AppError.forbidden("你只能编辑自己提交的内容");
@@ -331,27 +357,72 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
     );
   }
 
+  // 并发编辑检测：客户端带来基线版本，且服务端内容在此期间被别人保存过，
+  // 就做三路合并——能自动合的自动合，冲突字段保留两份，返回 409 让编辑者逐项确认。
+  let effective: UpdateSpotInput = input;
+  let merge: UpdateSpotOutcome["merge"] = null;
+
+  if (input.baseUpdatedAt) {
+    const baseTime = new Date(input.baseUpdatedAt);
+    if (Number.isNaN(baseTime.getTime())) throw AppError.badRequest("baseUpdatedAt 时间格式不正确");
+
+    if (baseTime.getTime() !== spot.updatedAt.getTime()) {
+      if (!input.base) {
+        // 没有基线快照就无法合并，让客户端刷新后重来，不能静默覆盖别人的改动
+        throw editConflictError("这条记录在你编辑期间被他人修改了，请刷新获取最新内容后再改", {
+          currentUpdatedAt: spot.updatedAt,
+          conflicts: [],
+          merged: null,
+        });
+      }
+
+      const theirs: SpotFormState = {
+        categoryCode: spot.category.code,
+        title: spot.title,
+        description: spot.description ?? "",
+        attributes: (spot.attributes ?? {}) as Record<string, unknown>,
+        lat: spot.exactLat,
+        lng: spot.exactLng,
+        fuzzEnabled: spot.fuzzEnabled,
+        fuzzRadiusM: spot.fuzzRadiusM,
+        mediaUuids: spot.media.map((asset) => asset.uuid),
+      };
+
+      const outcome = mergeSpotInput(input.base, theirs, input, { resolveConflicts: input.resolveConflicts });
+      if (outcome.conflicts.length > 0) {
+        throw editConflictError("这条记录在你编辑期间被他人修改了，以下字段需要逐项确认取舍", {
+          currentUpdatedAt: spot.updatedAt,
+          conflicts: outcome.conflicts,
+          merged: outcome.merged,
+        });
+      }
+
+      effective = { ...outcome.merged };
+      merge = { autoMergedFields: outcome.autoMergedFields };
+    }
+  }
+
   const data: Prisma.SpotUpdateInput = {};
 
-  if (input.title !== undefined) data.title = input.title;
-  if (input.description !== undefined) data.description = input.description || null;
-  if (input.title !== undefined || input.description !== undefined) {
-    assertNoBlockedContent(input.title ?? spot.title, input.description ?? spot.description);
+  if (effective.title !== undefined) data.title = effective.title;
+  if (effective.description !== undefined) data.description = effective.description || null;
+  if (effective.title !== undefined || effective.description !== undefined) {
+    assertNoBlockedContent(effective.title ?? spot.title, effective.description ?? spot.description);
   }
 
-  if (input.categoryCode !== undefined) {
-    const category = await requireCategoryByCode(input.categoryCode);
+  if (effective.categoryCode !== undefined) {
+    const category = await requireCategoryByCode(effective.categoryCode);
     data.category = { connect: { id: category.id } };
   }
-  if (input.attributes !== undefined) data.attributes = toJsonValue(input.attributes);
-  if (input.lat !== undefined) data.exactLat = input.lat;
-  if (input.lng !== undefined) data.exactLng = input.lng;
-  if (input.fuzzEnabled !== undefined) data.fuzzEnabled = input.fuzzEnabled;
-  if (input.fuzzRadiusM !== undefined) {
-    data.fuzzRadiusM = input.fuzzEnabled === false ? 0 : input.fuzzRadiusM;
+  if (effective.attributes !== undefined) data.attributes = toJsonValue(effective.attributes);
+  if (effective.lat !== undefined) data.exactLat = effective.lat;
+  if (effective.lng !== undefined) data.exactLng = effective.lng;
+  if (effective.fuzzEnabled !== undefined) data.fuzzEnabled = effective.fuzzEnabled;
+  if (effective.fuzzRadiusM !== undefined) {
+    data.fuzzRadiusM = effective.fuzzEnabled === false ? 0 : effective.fuzzRadiusM;
   }
 
-  if (input.lat !== undefined && input.lng !== undefined && !isValidLatLng(input.lat, input.lng)) {
+  if (effective.lat !== undefined && effective.lng !== undefined && !isValidLatLng(effective.lat, effective.lng)) {
     throw AppError.badRequest("坐标不合法");
   }
 
@@ -365,12 +436,12 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
 
   await prisma.spot.update({ where: { id: spot.id }, data });
 
-  if (input.mediaUuids !== undefined) {
+  if (effective.mediaUuids !== undefined) {
     await prisma.mediaAsset.updateMany({ where: { spotId: spot.id }, data: { spotId: null } });
-    await attachMedia(spot.id, spot.ownerId, input.mediaUuids);
+    await attachMedia(spot.id, spot.ownerId, effective.mediaUuids);
   }
 
-  return getSpotByUuid(uuid, user);
+  return { spot: await getSpotByUuid(uuid, user), merge };
 }
 
 export async function deleteSpot(uuid: string, user: AuthUser) {

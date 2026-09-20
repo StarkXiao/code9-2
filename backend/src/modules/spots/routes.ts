@@ -75,8 +75,8 @@ spotsRouter.patch(
   writeLimiter,
   validate({ params: uuidParamSchema, body: updateSpotSchema }),
   asyncHandler(async (req, res) => {
-    const spot = await updateSpot(req.params.uuid, req.user!, req.body);
-    res.json(ok(req, spot));
+    const result = await updateSpot(req.params.uuid, req.user!, req.body);
+    res.json(ok(req, { ...result.spot, merge: result.merge }));
   }),
 );
 

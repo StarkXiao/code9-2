@@ -19,7 +19,18 @@ export const createSpotSchema = z.object({
   mediaUuids: z.array(z.string().uuid("图片标识不正确")).max(6, "最多 6 张图片").default([]),
 });
 
-export const updateSpotSchema = createSpotSchema.partial();
+export const updateSpotSchema = createSpotSchema.partial().extend({
+  /**
+   * 并发编辑合并（见 merge.ts）：
+   * - baseUpdatedAt：编辑页加载时拿到的条目 updatedAt，作为乐观锁版本标记；
+   * - base：加载时的表单快照，服务端用它做三路合并的基线；
+   * - resolveConflicts：编辑者已在页面上逐项确认取舍后置 true，冲突字段以提交值为准。
+   * 三者都可缺省，缺省时保持原来的"直接覆盖"行为，兼容旧调用方。
+   */
+  baseUpdatedAt: z.string().datetime({ offset: true, message: "baseUpdatedAt 时间格式不正确" }).optional(),
+  base: createSpotSchema.partial().optional(),
+  resolveConflicts: z.boolean().optional(),
+});
 
 export const listSpotsQuerySchema = z.object({
   bbox: z.string().optional(),
